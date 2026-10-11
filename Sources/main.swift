@@ -70,6 +70,11 @@ let typingGrace = 0.4         // ignore taps this soon after a key press
 let twoFingerLandSpread = 0.15 // both fingers of a two-finger tap must land this close together
 let magic: Int64 = 0x5450_4744 // marks our own synthetic events ("TPGD")
 let freezeWindow = defaults.object(forKey: "freezeWindow") as? Double ?? 0.45 // driver slow-down after a press
+// Only smooth fast movement: macOS slows the pointer for slow, precise finger motion, so a
+// speed measured earlier would overshoot while you aim. Normalized trackpad units / second.
+let smoothMinSpeed = defaults.object(forKey: "smoothMinSpeed") as? Double ?? 0.25
+// Err on the side of less movement: overshooting a click target is worse than a tiny lag.
+let smoothGainScale = defaults.object(forKey: "smoothGainScale") as? Double ?? 0.85
 
 // MARK: - Touch state (written on the multitouch thread, guarded by lock)
 let lock = NSLock()
@@ -237,14 +242,14 @@ func beginFreeze() {
     var moving = false
     if f != nil, t - touchStart > 0.12, let last = recentFinger.last,
        let old = recentFinger.first(where: { last.t - $0.t <= 0.12 }), last.t - old.t >= 0.05 {
-        moving = hypot(Double(last.x - old.x), Double(last.y - old.y)) > 0.008
+        moving = hypot(Double(last.x - old.x), Double(last.y - old.y)) / (last.t - old.t) > smoothMinSpeed
     }
     lock.unlock()
     // A finger that was not already moving is tapping or resting: keep the driver's
     // freeze, it is what stops the pointer wobbling during a click.
     guard let f = f, moving, let c = CGEvent(source: nil)?.location else { freeze = nil; return }
     let (gx, gy, how) = currentGain()
-    freeze = (t, f.path, f.x, f.y, c, gx, gy)
+    freeze = (t, f.path, f.x, f.y, c, gx * smoothGainScale, gy * smoothGainScale)
     log(String(format: "freeze while moving: gain x=%.0f y=%.0f (%@)", gx, gy, how))
 }
 
@@ -441,6 +446,23 @@ func synthesizeClick(right: Bool, touchStarted: Double, fromSystem: Bool = false
     return true
 }
 
+// MARK: - Scroll recovery
+let naturalScrolling = UserDefaults(suiteName: ".GlobalPreferences")?.object(forKey: "com.apple.swipescrolldirection") as? Bool ?? true
+var recoveredScrolls = 0
+
+func postScroll(dx: Int64, dy: Int64) {
+    guard dx != 0 || dy != 0 else { return }
+    // Natural scrolling: content follows the fingers (fingers down -> content down).
+    let sign: Int32 = naturalScrolling ? 1 : -1
+    guard let e = CGEvent(scrollWheelEvent2Source: synthSource, units: .pixel, wheelCount: 2,
+                          wheel1: sign * Int32(clamping: dy), wheel2: sign * Int32(clamping: dx), wheel3: 0) else { return }
+    e.setIntegerValueField(.eventSourceUserData, value: magic)
+    e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+    e.post(tap: .cghidEventTap)
+    recoveredScrolls += 1
+    if recoveredScrolls % 20 == 1 { log("turned a false-press drag back into scrolling (\(recoveredScrolls) events so far)") }
+}
+
 // MARK: - Event tap
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     let pass = Unmanaged.passUnretained(event)
@@ -465,6 +487,13 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         if suppressR { suppressR = false; return nil }
     case .leftMouseDragged, .rightMouseDragged:
         if (type == .leftMouseDragged && suppressL) || (type == .rightMouseDragged && suppressR) {
+            lock.lock(); let fingers = fingersDown; lock.unlock()
+            if fingers >= 2 {
+                // A false press during a two-finger scroll makes the driver send drags instead
+                // of scrolling: turn them back into scrolling rather than moving the pointer.
+                postScroll(dx: event.getIntegerValueField(.mouseEventDeltaX), dy: event.getIntegerValueField(.mouseEventDeltaY))
+                return nil
+            }
             event.type = .mouseMoved
         }
     case .leftMouseDown, .rightMouseDown:

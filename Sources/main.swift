@@ -5,7 +5,10 @@
 //    (or just lifted) are dropped, and their drags become plain pointer moves.
 //    Real taps, read from the raw touch sensor, become clicks instead
 //    (1 finger = left, 2 fingers = right). Three-finger drag is let through.
-//  - Smooth pointer: after every press the trackpad driver freezes or slows the pointer
+//  - Calm force response: tells the trackpad driver to stop reacting to force. The
+//    sensor still reports false presses (they are blocked above), but the driver no
+//    longer freezes the pointer after each one or turns two-finger scrolls into drags.
+//  - Smooth pointer (fallback when force response stays on): after every press the trackpad driver freezes or slows the pointer
 //    for about 300 ms (to stop it wobbling while you click). With a faulty sensor that
 //    happens constantly, so during that window the pointer is kept where the raw finger
 //    motion says it should be, at the speed measured just before the press.
@@ -51,16 +54,19 @@ func now() -> Double { ProcessInfo.processInfo.systemUptime }
 
 // MARK: - Settings
 let defaults = UserDefaults.standard
-defaults.register(defaults: ["blockClicks": true, "silenceVibration": true])
+defaults.register(defaults: ["blockClicks": true, "silenceVibration": true, "calmForce": true])
 var blockClicks = defaults.bool(forKey: "blockClicks")
 var silenceVibration = defaults.bool(forKey: "silenceVibration")
+var calmForce = defaults.bool(forKey: "calmForce")
 
 // MARK: - Tuning
 let tapMaxDuration = 0.30     // seconds a tap may last
 let tapMaxMove: Float = 0.035 // normalized trackpad distance a tap may move
 let tapMaxSize: Float = 1.5   // bigger contacts (palms) never count as taps
-let liftGrace = 0.30          // hardware clicks this soon after a lift are dropped too
+let liftGrace = 1.0           // clicks this soon after a lift are macOS's own tap-to-click (a two-finger
+                              // tap arrives ~0.3 s late while macOS waits for a possible double tap)
 let typingGrace = 0.4         // ignore taps this soon after a key press
+let twoFingerLandSpread = 0.15 // both fingers of a two-finger tap must land this close together
 let magic: Int64 = 0x5450_4744 // marks our own synthetic events ("TPGD")
 let freezeWindow = defaults.object(forKey: "freezeWindow") as? Double ?? 0.45 // driver slow-down after a press
 
@@ -73,9 +79,11 @@ var touchMaxFingers = 0
 var touchMaxMove: Float = 0
 var touchMaxSize: Float = 0
 var touchStartPos: [Int32: (Float, Float)] = [:]
+var touchLandTimes: [Int32: Double] = [:]
 // Pointer smoothing (also guarded by lock)
-var singleFinger: (x: Float, y: Float)?  // position when exactly one finger is down
+var singleFinger: (path: Int32, x: Float, y: Float)?  // when exactly one finger is down
 var freezeUntil: Double = 0              // set when a press is blocked
+var recentFinger: [(t: Double, path: Int32, x: Float, y: Float)] = [] // last ~0.25 s of the single finger
 
 // Main-thread state
 var blockedCount = 0
@@ -86,6 +94,7 @@ var gTap: CFMachPort?
 var suppressL = false
 var suppressR = false
 var appDelegate: AppDelegate?
+var lastSessionHandled = false // did we already click for the last touch?
 
 // MARK: - MultitouchSupport (private framework)
 typealias MTCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
@@ -111,6 +120,8 @@ struct MTFunctions {
     let actuatorIsOpen: MTBoolFn?
     let getSystemActuations: MTBoolFn?
     let setSystemActuations: MTSetBoolFn?
+    let getForceResponse: MTBoolFn?
+    let setForceResponse: MTSetBoolFn?
 
     static func load() -> MTFunctions? {
         guard let h = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW) else { return nil }
@@ -128,7 +139,9 @@ struct MTFunctions {
             actuatorClose: sym("MTActuatorClose", MTStatusFn.self),
             actuatorIsOpen: sym("MTActuatorIsOpen", MTBoolFn.self),
             getSystemActuations: sym("MTActuatorGetSystemActuationsEnabled", MTBoolFn.self),
-            setSystemActuations: sym("MTActuatorSetSystemActuationsEnabled", MTSetBoolFn.self))
+            setSystemActuations: sym("MTActuatorSetSystemActuationsEnabled", MTSetBoolFn.self),
+            getForceResponse: sym("MTDeviceGetSystemForceResponseEnabled", MTBoolFn.self),
+            setForceResponse: sym("MTDeviceSetSystemForceResponseEnabled", MTSetBoolFn.self))
     }
 }
 
@@ -152,8 +165,17 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
     }
     let t = now()
     var tap = 0
+    var tapStarted = 0.0
+    var ended = false
     lock.lock()
-    singleFinger = active == 1 ? (points[0].1, points[0].2) : nil
+    singleFinger = active == 1 ? (points[0].0, points[0].1, points[0].2) : nil
+    if let f = singleFinger {
+        if let last = recentFinger.last, last.path != f.path { recentFinger.removeAll() }
+        recentFinger.append((t, f.path, f.x, f.y))
+        if let first = recentFinger.first, t - first.t > 0.25 { recentFinger.removeFirst() }
+    } else {
+        recentFinger.removeAll()
+    }
     let smooth = t < freezeUntil ? singleFinger : nil
     if active > 0 {
         if fingersDown == 0 {
@@ -162,29 +184,38 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
             touchMaxMove = 0
             touchMaxSize = 0
             touchStartPos.removeAll()
+            touchLandTimes.removeAll()
         }
         for (path, x, y) in points {
             if let s = touchStartPos[path] {
                 touchMaxMove = max(touchMaxMove, max(abs(x - s.0), abs(y - s.1)))
             } else {
                 touchStartPos[path] = (x, y)
+                touchLandTimes[path] = t
             }
         }
         touchMaxFingers = max(touchMaxFingers, active)
         touchMaxSize = max(touchMaxSize, maxSize)
         lastContact = t
     } else if fingersDown > 0 {
+        ended = true
         if t - touchStart < tapMaxDuration && touchMaxMove < tapMaxMove && touchMaxSize < tapMaxSize {
-            tap = touchMaxFingers == 1 ? 1 : (touchMaxFingers == 2 ? 2 : 0)
+            let lands = touchLandTimes.values
+            let together = (lands.max() ?? 0) - (lands.min() ?? 0) < twoFingerLandSpread
+            tap = touchMaxFingers == 1 ? 1 : (touchMaxFingers == 2 && together ? 2 : 0)
+            tapStarted = touchStart
         }
     }
     fingersDown = active
     lock.unlock()
-    if tap != 0 {
-        DispatchQueue.main.async { synthesizeClick(right: tap == 2) }
+    if active == 0 && ended {
+        DispatchQueue.main.async {
+            lastSessionHandled = false
+            if tap != 0 { lastSessionHandled = synthesizeClick(right: tap == 2, touchStarted: tapStarted) }
+        }
     }
     if let f = smooth {
-        DispatchQueue.main.async { smoothStep(x: f.x, y: f.y) }
+        DispatchQueue.main.async { smoothStep(path: f.path, x: f.x, y: f.y) }
     }
     return 0
 }
@@ -194,22 +225,34 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
 //   start position + gain * (finger travel since the press),
 // with the gain measured from the movement just before the press. Whatever the
 // driver does not deliver is topped up; the pointer is never pulled backwards.
-var freeze: (t0: Double, fx: Float, fy: Float, c0: CGPoint, gx: Double, gy: Double)?
+var freeze: (t0: Double, path: Int32, fx: Float, fy: Float, c0: CGPoint, gx: Double, gy: Double)?
 
 func beginFreeze() {
+    guard !calmForce else { freeze = nil; return } // the driver does not freeze when force response is off
+    let t = now()
     lock.lock()
     let f = singleFinger
-    freezeUntil = now() + freezeWindow
+    freezeUntil = t + freezeWindow
+    // Was this finger already moving? Look at the raw sensor over the last ~0.12 s.
+    var moving = false
+    if f != nil, t - touchStart > 0.12, let last = recentFinger.last,
+       let old = recentFinger.first(where: { last.t - $0.t <= 0.12 }), last.t - old.t >= 0.05 {
+        moving = hypot(Double(last.x - old.x), Double(last.y - old.y)) > 0.008
+    }
     lock.unlock()
-    guard let f = f, let c = CGEvent(source: nil)?.location else { freeze = nil; return }
+    // A finger that was not already moving is tapping or resting: keep the driver's
+    // freeze, it is what stops the pointer wobbling during a click.
+    guard let f = f, moving, let c = CGEvent(source: nil)?.location else { freeze = nil; return }
     let (gx, gy, how) = currentGain()
-    freeze = (now(), f.x, f.y, c, gx, gy)
-    log(String(format: "freeze: gain x=%.0f y=%.0f (%@)", gx, gy, how))
+    freeze = (t, f.path, f.x, f.y, c, gx, gy)
+    log(String(format: "freeze while moving: gain x=%.0f y=%.0f (%@)", gx, gy, how))
 }
 
-func smoothStep(x: Float, y: Float) {
-    guard blockClicks, gTap != nil, let fz = freeze, now() - fz.t0 < freezeWindow,
-          let c = CGEvent(source: nil)?.location else { return }
+func smoothStep(path: Int32, x: Float, y: Float) {
+    guard blockClicks, gTap != nil, let fz = freeze, now() - fz.t0 < freezeWindow else { return }
+    // A different finger (one of two lifted) is not movement: stop smoothing.
+    guard path == fz.path else { freeze = nil; return }
+    guard let c = CGEvent(source: nil)?.location else { return }
     let ex = Double(x - fz.fx) * fz.gx, ey = Double(y - fz.fy) * fz.gy
     var dx = ex - (c.x - fz.c0.x), dy = ey - (c.y - fz.c0.y)
     if dx * ex < 0 { dx = 0 } // already ahead on this axis: never pull back
@@ -228,7 +271,7 @@ func smoothStep(x: Float, y: Float) {
 
 // Pointer speed: a short history of (finger, pointer) samples taken during normal
 // movement, plus a long-term average as a fallback.
-var speedHistory: [(t: Double, x: Float, y: Float, c: CGPoint)] = []
+var speedHistory: [(t: Double, path: Int32, x: Float, y: Float, c: CGPoint)] = []
 var avgGainX = 1000.0, avgGainY = -700.0
 func learnPointerSpeed() {
     let t = now()
@@ -237,18 +280,22 @@ func learnPointerSpeed() {
     let frozen = t < freezeUntil + 0.1
     lock.unlock()
     guard let f = finger, !frozen, let c = CGEvent(source: nil)?.location else { speedHistory.removeAll(); return }
+    if let p = speedHistory.last, p.path != f.path { speedHistory.removeAll() }
     if let p = speedHistory.last {
         let fdx = Double(f.x - p.x), fdy = Double(f.y - p.y)
         if abs(fdx) > 0.004 { let g = Double(c.x - p.c.x) / fdx; if abs(g) > 100 && abs(g) < 8000 { avgGainX = avgGainX * 0.9 + g * 0.1 } }
         if abs(fdy) > 0.004 { let g = Double(c.y - p.c.y) / fdy; if abs(g) > 100 && abs(g) < 8000 { avgGainY = avgGainY * 0.9 + g * 0.1 } }
     }
-    speedHistory.append((t, f.x, f.y, c))
+    speedHistory.append((t, f.path, f.x, f.y, c))
     speedHistory.removeAll { t - $0.t > 0.5 }
 }
 
+// Pointer speed from the movement just before now, or the long-term average.
 func currentGain() -> (Double, Double, String) {
-    guard let last = speedHistory.last, let first = speedHistory.first(where: { last.t - $0.t <= 0.35 }),
-          now() - last.t < 0.15 else { return (avgGainX, avgGainY, "average") }
+    guard let last = speedHistory.last, now() - last.t < 0.12,
+          let first = speedHistory.first(where: { last.t - $0.t <= 0.35 }), last.t - first.t >= 0.09 else {
+        return (avgGainX, avgGainY, "average")
+    }
     let fdx = Double(last.x - first.x), fdy = Double(last.y - first.y)
     var gx = avgGainX, gy = avgGainY
     if abs(fdx) > 0.01 { let g = Double(last.c.x - first.c.x) / fdx; if abs(g) > 100 && abs(g) < 8000 { gx = g } }
@@ -291,6 +338,7 @@ final class Trackpad {
             }
             log("attached to built-in trackpad (actuator: \(actuator != nil ? "yes" : "no"))")
             applyVibration()
+            applyForceResponse()
             return
         }
         log("built-in trackpad not found")
@@ -302,6 +350,7 @@ final class Trackpad {
             if mt.actuatorIsOpen?(act) ?? false { _ = mt.actuatorClose?(act) }
         }
         if let dev = device {
+            if restoreVibration, calmForce { _ = mt.setForceResponse?(dev, true); log("force response restored") }
             mt.unregister?(dev, mtCallback)
             mt.stop?(dev)
         }
@@ -322,6 +371,17 @@ final class Trackpad {
         log(String(format: "vibration %@ -> 0x%08x", silenceVibration ? "off" : "on", UInt32(bitPattern: st)))
     }
 
+    var forceResponseOn: Bool? {
+        guard let dev = device, let get = mt.getForceResponse else { return nil }
+        return get(dev)
+    }
+
+    func applyForceResponse() {
+        guard let dev = device, let set = mt.setForceResponse else { return }
+        let st = set(dev, !calmForce)
+        log(String(format: "force response %@ -> 0x%08x", calmForce ? "off" : "on", UInt32(bitPattern: st)))
+    }
+
     // Timer: re-attach if the actuator went away, re-apply if macOS turned vibration back on.
     func check() {
         guard device != nil else { attach(); return }
@@ -329,6 +389,10 @@ final class Trackpad {
         if silenceVibration, vibrationOn == true {
             log("vibration was turned back on; re-applying")
             applyVibration()
+        }
+        if calmForce, forceResponseOn == true {
+            log("force response was turned back on; re-applying")
+            applyForceResponse()
         }
     }
 }
@@ -338,11 +402,18 @@ let synthSource = CGEventSource(stateID: .privateState)
 var lastSynth: (t: Double, loc: CGPoint, right: Bool) = (-10, .zero, false)
 var synthClickState: Int64 = 1
 
-func synthesizeClick(right: Bool) {
-    guard blockClicks, gTap != nil else { return }
+// fromSystem: macOS itself recognized the tap (its own tap-to-click), so trust it.
+@discardableResult
+func synthesizeClick(right: Bool, touchStarted: Double, fromSystem: Bool = false) -> Bool {
+    guard blockClicks, gTap != nil else { return false }
     if CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown) < typingGrace {
         log("tap ignored (typing)")
-        return
+        return false
+    }
+    if !fromSystem,
+       CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .scrollWheel) < now() - touchStarted + 0.05 {
+        log("tap ignored (scrolling); leaving it to macOS")
+        return false
     }
     let loc = CGEvent(source: nil)?.location ?? .zero
     let t = now()
@@ -356,7 +427,7 @@ func synthesizeClick(right: Bool) {
     let (downType, upType, button): (CGEventType, CGEventType, CGMouseButton) =
         right ? (.rightMouseDown, .rightMouseUp, .right) : (.leftMouseDown, .leftMouseUp, .left)
     guard let down = CGEvent(mouseEventSource: synthSource, mouseType: downType, mouseCursorPosition: loc, mouseButton: button),
-          let up = CGEvent(mouseEventSource: synthSource, mouseType: upType, mouseCursorPosition: loc, mouseButton: button) else { return }
+          let up = CGEvent(mouseEventSource: synthSource, mouseType: upType, mouseCursorPosition: loc, mouseButton: button) else { return false }
     let flags = CGEventSource.flagsState(.combinedSessionState)
     for e in [down, up] {
         e.setIntegerValueField(.eventSourceUserData, value: magic)
@@ -366,7 +437,8 @@ func synthesizeClick(right: Bool) {
     down.post(tap: .cghidEventTap)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.015) { up.post(tap: .cghidEventTap) }
     tapClickCount += 1
-    log("tap -> \(right ? "right" : "left") click x\(synthClickState)")
+    log("\(fromSystem ? "macOS tap" : "tap") -> \(right ? "right" : "left") click x\(synthClickState)")
+    return true
 }
 
 // MARK: - Event tap
@@ -406,6 +478,14 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         let onPad = fingers > 0 || sinceLift < liftGrace
         if onPad && !(left && maxFingers >= 3) {
             if left { suppressL = true } else { suppressR = true }
+            if fingers == 0 {
+                // No finger on the pad: this is macOS's own tap-to-click arriving after a lift.
+                // Click for it only if we did not already click for this touch.
+                if !lastSessionHandled {
+                    lastSessionHandled = synthesizeClick(right: !left, touchStarted: 0, fromSystem: true)
+                }
+                return nil
+            }
             blockedCount += 1
             beginFreeze()
             log("blocked \(left ? "left" : "right") press (fingers=\(fingers), msSinceLift=\(Int(sinceLift * 1000)))")
@@ -441,6 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let blockItem = NSMenuItem(title: "Block false clicks (Ctrl+Option+Cmd+B)", action: #selector(toggleBlock), keyEquivalent: "")
     let silenceItem = NSMenuItem(title: "Silence trackpad vibration", action: #selector(toggleSilence), keyEquivalent: "")
+    let calmItem = NSMenuItem(title: "Turn off force response (fixes lag and scrolling)", action: #selector(toggleCalm), keyEquivalent: "")
     let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
     let permissionItem = NSMenuItem(title: "Grant Accessibility permission...", action: #selector(openAccessibility), keyEquivalent: "")
     var timer: Timer?
@@ -457,7 +538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine.isEnabled = false
         menu.addItem(statusLine)
         menu.addItem(.separator())
-        for i in [blockItem, silenceItem, loginItem, permissionItem] {
+        for i in [blockItem, silenceItem, calmItem, loginItem, permissionItem] {
             i.target = self
             menu.addItem(i)
         }
@@ -569,6 +650,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         blockItem.state = blockClicks ? .on : .off
         silenceItem.state = silenceVibration ? .on : .off
         silenceItem.isEnabled = trackpad?.actuator != nil
+        calmItem.state = calmForce ? .on : .off
+        calmItem.isEnabled = trackpad?.mt.setForceResponse != nil
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         permissionItem.isHidden = trusted
     }
@@ -579,6 +662,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         silenceVibration.toggle()
         defaults.set(silenceVibration, forKey: "silenceVibration")
         trackpad?.applyVibration()
+    }
+
+    @objc func toggleCalm() {
+        calmForce.toggle()
+        defaults.set(calmForce, forKey: "calmForce")
+        trackpad?.applyForceResponse()
     }
 
     @objc func toggleLogin() {

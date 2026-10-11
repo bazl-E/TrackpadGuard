@@ -19,9 +19,12 @@ The touch surface itself usually still works perfectly. Only the force sensor is
 | Feature | How |
 |---|---|
 | **Block false clicks** | Hardware clicks that arrive while a finger is on the trackpad are dropped, and their drags become normal pointer moves. Real taps, read directly from the raw touch sensor, become clicks instead. |
-| **Smooth pointer** | During the ~300 ms freeze the driver applies after each (false) press, the pointer is moved from your actual finger motion, at the speed learned from your normal movement. |
+| **Turn off force response** | Tells the trackpad driver to stop reacting to force. The sensor still reports false presses (they are blocked), but the driver no longer freezes the pointer for ~300 ms after each one or turns two-finger scrolls into drags. This is what removes the lag and the missed scrolls. Restored when you quit. |
+| **Smooth pointer** (fallback) | Only used if force response is left on: during the driver's post-press freeze, the pointer is moved from your actual finger motion at the speed measured just before the press. |
 | **Silence vibration** | Turns off system actuations on the trackpad's haptic motor, so false presses no longer buzz. Restored when you quit. |
 | **Open at login** | A menu toggle. |
+
+Taps are recognized from the raw touch sensor. When TrackpadGuard is unsure (for example a short two-finger touch that might have been the start of a scroll), it leaves the decision to macOS's own tap-to-click, so you never get two clicks for one tap.
 
 Controls once it is running:
 
@@ -67,6 +70,7 @@ If clicks show up as **"while finger on pad"** when you were only resting or sli
 
 - Raw touch data comes from Apple's private `MultitouchSupport` framework (`MTRegisterContactFrameCallback`).
 - Clicks are filtered with a `CGEventTap` at the HID level (this is what needs Accessibility permission).
+- The driver's reaction to force is turned off with `MTDeviceSetSystemForceResponseEnabled(device, false)`.
 - The haptic motor is silenced with `MTActuatorSetSystemActuationsEnabled(actuator, false)`. Note that reprogramming the firmware click waveform did not help on the test machine: the click haptic is driven by the system, not the trackpad firmware.
 
 Logs are written to `~/Library/Logs/TrackpadGuard.log`.

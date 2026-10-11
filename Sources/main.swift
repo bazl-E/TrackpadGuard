@@ -7,8 +7,9 @@
 //    (1 finger = left, 2 fingers = right). Three-finger drag is let through.
 //  - Calm force response: tells the trackpad driver to stop reacting to force. The
 //    sensor still reports false presses (they are blocked above), but the driver no
-//    longer freezes the pointer after each one or turns two-finger scrolls into drags.
-//  - Smooth pointer (fallback when force response stays on): after every press the trackpad driver freezes or slows the pointer
+//    longer turns two-finger scrolls into drags, and its pointer freeze after each
+//    press happens about half as often.
+//  - Smooth pointer: after a press the trackpad driver can still freeze or slow the pointer
 //    for about 300 ms (to stop it wobbling while you click). With a faulty sensor that
 //    happens constantly, so during that window the pointer is kept where the raw finger
 //    motion says it should be, at the speed measured just before the press.
@@ -228,7 +229,6 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
 var freeze: (t0: Double, path: Int32, fx: Float, fy: Float, c0: CGPoint, gx: Double, gy: Double)?
 
 func beginFreeze() {
-    guard !calmForce else { freeze = nil; return } // the driver does not freeze when force response is off
     let t = now()
     lock.lock()
     let f = singleFinger

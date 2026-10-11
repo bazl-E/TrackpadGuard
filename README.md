@@ -19,8 +19,8 @@ The touch surface itself usually still works perfectly. Only the force sensor is
 | Feature | How |
 |---|---|
 | **Block false clicks** | Hardware clicks that arrive while a finger is on the trackpad are dropped, and their drags become normal pointer moves. Real taps, read directly from the raw touch sensor, become clicks instead. |
-| **Turn off force response** | Tells the trackpad driver to stop reacting to force. The sensor still reports false presses (they are blocked), but the driver no longer freezes the pointer for ~300 ms after each one or turns two-finger scrolls into drags. This is what removes the lag and the missed scrolls. Restored when you quit. |
-| **Smooth pointer** (fallback) | Only used if force response is left on: during the driver's post-press freeze, the pointer is moved from your actual finger motion at the speed measured just before the press. |
+| **Turn off force response** | Tells the trackpad driver to stop reacting to force. The sensor still reports false presses (they are blocked), but the driver no longer turns two-finger scrolls into drags, and its ~300 ms pointer freeze after each press happens about half as often. Restored when you quit. |
+| **Smooth pointer** | If the driver still freezes the pointer after a false press while your finger is moving, the pointer is moved from your actual finger motion at the speed measured just before the press. Together with the setting above, this took the share of stuck moments right after a false press from 67% to 0-7% on the test machine. |
 | **Silence vibration** | Turns off system actuations on the trackpad's haptic motor, so false presses no longer buzz. Restored when you quit. |
 | **Open at login** | A menu toggle. |
 

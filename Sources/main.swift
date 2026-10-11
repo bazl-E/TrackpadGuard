@@ -71,6 +71,9 @@ let liftGrace = 1.0           // clicks this soon after a lift are macOS's own t
 let typingGrace = 0.4         // ignore taps this soon after a key press
 let twoFingerLandSpread = 0.15 // both fingers of a two-finger tap must land this close together
 let magic: Int64 = 0x5450_4744 // marks our own synthetic events ("TPGD")
+let sensorScrollWindow = 1.0  // max length of one sensor-scroll episode after a two-finger false press
+let scrollGainY = defaults.object(forKey: "scrollGainY") as? Double ?? 1800 // pixels per trackpad height
+let scrollGainX = scrollGainY * 1.6 // the trackpad is ~1.6x wider than tall
 let freezeWindow = defaults.object(forKey: "freezeWindow") as? Double ?? 0.45 // driver slow-down after a press
 // Only smooth fast movement: macOS slows the pointer for slow, precise finger motion, so a
 // speed measured earlier would overshoot while you aim. Normalized trackpad units / second.
@@ -91,6 +94,9 @@ var touchLandTimes: [Int32: Double] = [:]
 // Pointer smoothing (also guarded by lock)
 var singleFinger: (path: Int32, x: Float, y: Float)?  // when exactly one finger is down
 var freezeUntil: Double = 0              // set when a press is blocked
+// Scrolling from the raw sensor while a false press has frozen a two-finger scroll.
+var sensorScrollUntil: Double = 0
+var prevPair: (x: Float, y: Float)?
 var recentFinger: [(t: Double, path: Int32, x: Float, y: Float)] = [] // last ~0.25 s of the single finger
 
 // Main-thread state
@@ -185,6 +191,17 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
         recentFinger.removeAll()
     }
     let smooth = t < freezeUntil ? singleFinger : nil
+    var sensorScroll: (Double, Double)?
+    if active == 2 {
+        let pair = ((points[0].1 + points[1].1) / 2, (points[0].2 + points[1].2) / 2)
+        if t < sensorScrollUntil, let p = prevPair {
+            sensorScroll = (Double(pair.0 - p.x) * scrollGainX, Double(pair.1 - p.y) * scrollGainY)
+        }
+        prevPair = (pair.0, pair.1)
+    } else {
+        prevPair = nil
+        sensorScrollUntil = 0 // episode ends when the two-finger contact ends
+    }
     if active > 0 {
         if fingersDown == 0 {
             touchStart = t
@@ -224,6 +241,10 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
     }
     if let f = smooth {
         DispatchQueue.main.async { smoothStep(path: f.path, x: f.x, y: f.y) }
+    }
+    if let (dx, dy) = sensorScroll {
+        // Trackpad y grows upward; screen-style deltas grow downward.
+        DispatchQueue.main.async { postSensorScroll(dx: dx, dy: -dy) }
     }
     return 0
 }
@@ -465,6 +486,14 @@ func endScrollPin() {
 let naturalScrolling = UserDefaults(suiteName: ".GlobalPreferences")?.object(forKey: "com.apple.swipescrolldirection") as? Bool ?? true
 var recoveredScrolls = 0
 
+var scrollRemainder = (x: 0.0, y: 0.0)
+func postSensorScroll(dx: Double, dy: Double) {
+    let x = dx + scrollRemainder.x, y = dy + scrollRemainder.y
+    let ix = x.rounded(.towardZero), iy = y.rounded(.towardZero)
+    scrollRemainder = (x - ix, y - iy)
+    postScroll(dx: Int64(ix), dy: Int64(iy))
+}
+
 func postScroll(dx: Int64, dy: Int64) {
     guard dx != 0 || dy != 0 else { return }
     // Natural scrolling: content follows the fingers (fingers down -> content down).
@@ -475,7 +504,7 @@ func postScroll(dx: Int64, dy: Int64) {
     e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
     e.post(tap: .cghidEventTap)
     recoveredScrolls += 1
-    if recoveredScrolls % 20 == 1 { log("turned a false-press drag back into scrolling (\(recoveredScrolls) events so far)") }
+    if recoveredScrolls % 20 == 1 { log("scrolling from the sensor during a false press (\(recoveredScrolls) events so far)") }
 }
 
 // MARK: - Event tap
@@ -504,11 +533,10 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         if (type == .leftMouseDragged && suppressL) || (type == .rightMouseDragged && suppressR) {
             lock.lock(); let fingers = fingersDown; lock.unlock()
             if fingers >= 2 {
-                // A false press during a two-finger scroll makes the driver send drags instead
-                // of scrolling: turn them back into scrolling, and keep the pointer pinned
-                // where it was (the drag motion must not move it).
+                // A false press during a two-finger scroll makes the driver freeze, then send
+                // drags instead of scrolling. Scrolling comes from the raw sensor meanwhile
+                // (see the multitouch callback); the drags must not move the pointer.
                 if scrollPin == nil { scrollPin = CGEvent(source: nil)?.location }
-                postScroll(dx: event.getIntegerValueField(.mouseEventDeltaX), dy: event.getIntegerValueField(.mouseEventDeltaY))
                 event.type = .mouseMoved
                 if let pin = scrollPin { event.location = pin }
                 event.setIntegerValueField(.mouseEventDeltaX, value: 0)
@@ -543,6 +571,10 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
             }
             blockedCount += 1
             beginFreeze()
+            if fingers == 2 {
+                lock.lock(); sensorScrollUntil = now() + sensorScrollWindow; lock.unlock()
+                scrollRemainder = (0, 0)
+            }
             log("blocked \(left ? "left" : "right") press (fingers=\(fingers), msSinceLift=\(Int(sinceLift * 1000)))")
             return nil
         }

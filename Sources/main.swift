@@ -450,6 +450,18 @@ func synthesizeClick(right: Bool, touchStarted: Double, fromSystem: Bool = false
 }
 
 // MARK: - Scroll recovery
+// Where the pointer was when a false press turned a scroll into a drag. The driver keeps
+// adding the drag motion to its own pointer position, so when the episode ends the pointer
+// is warped back here; otherwise it would jump by the whole accumulated distance.
+var scrollPin: CGPoint?
+
+func endScrollPin() {
+    guard let pin = scrollPin else { return }
+    scrollPin = nil
+    CGWarpMouseCursorPosition(pin)
+    CGAssociateMouseAndMouseCursorPosition(1) // no input pause after the warp
+    log("pointer kept in place after a false press during scrolling")
+}
 let naturalScrolling = UserDefaults(suiteName: ".GlobalPreferences")?.object(forKey: "com.apple.swipescrolldirection") as? Bool ?? true
 var recoveredScrolls = 0
 
@@ -485,16 +497,27 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
             return nil
         }
     case .leftMouseUp:
-        if suppressL { suppressL = false; return nil }
+        if suppressL { suppressL = false; endScrollPin(); return nil }
     case .rightMouseUp:
-        if suppressR { suppressR = false; return nil }
+        if suppressR { suppressR = false; endScrollPin(); return nil }
     case .leftMouseDragged, .rightMouseDragged:
         if (type == .leftMouseDragged && suppressL) || (type == .rightMouseDragged && suppressR) {
             lock.lock(); let fingers = fingersDown; lock.unlock()
             if fingers >= 2 {
                 // A false press during a two-finger scroll makes the driver send drags instead
-                // of scrolling: turn them back into scrolling rather than moving the pointer.
+                // of scrolling: turn them back into scrolling, and keep the pointer pinned
+                // where it was (the drag motion must not move it).
+                if scrollPin == nil { scrollPin = CGEvent(source: nil)?.location }
                 postScroll(dx: event.getIntegerValueField(.mouseEventDeltaX), dy: event.getIntegerValueField(.mouseEventDeltaY))
+                event.type = .mouseMoved
+                if let pin = scrollPin { event.location = pin }
+                event.setIntegerValueField(.mouseEventDeltaX, value: 0)
+                event.setIntegerValueField(.mouseEventDeltaY, value: 0)
+                return pass
+            }
+            if scrollPin != nil {
+                // Fingers went from two to one during the press: resync before moving again.
+                endScrollPin()
                 return nil
             }
             event.type = .mouseMoved

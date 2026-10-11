@@ -20,7 +20,7 @@ The touch surface itself usually still works perfectly. Only the force sensor is
 |---|---|
 | **Block false clicks** | Hardware clicks that arrive while a finger is on the trackpad are dropped, and their drags become normal pointer moves. Real taps, read directly from the raw touch sensor, become clicks instead. |
 | **Turn off force response** | Tells the trackpad driver to stop reacting to force. The sensor still reports false presses (they are blocked), but the driver no longer turns two-finger scrolls into drags, and its ~300 ms pointer freeze after each press happens about half as often. Restored when you quit. |
-| **Smooth pointer** | If the driver still freezes the pointer after a false press while your finger is moving, the pointer is moved from your actual finger motion at the speed measured just before the press. Together with the setting above, this took the share of stuck moments right after a false press from 67% to 0-7% on the test machine. |
+| **Smooth pointer** (optional, off by default) | Moves the pointer from your finger motion while the driver freezes it after a false press. It removes the stutter during fast movement, but macOS's speed-dependent pointer acceleration makes it overshoot when you slow down to click, so it is off unless you enable it in the menu. |
 | **Silence vibration** | Turns off system actuations on the trackpad's haptic motor, so false presses no longer buzz. Restored when you quit. |
 | **Open at login** | A menu toggle. |
 

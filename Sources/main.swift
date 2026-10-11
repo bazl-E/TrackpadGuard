@@ -9,7 +9,8 @@
 //    sensor still reports false presses (they are blocked above), but the driver no
 //    longer turns two-finger scrolls into drags, and its pointer freeze after each
 //    press happens about half as often.
-//  - Smooth pointer: after a press the trackpad driver can still freeze or slow the pointer
+//  - Smooth pointer (optional, off by default: macOS's speed-dependent pointer acceleration
+//    makes it overshoot when you slow down to click): after a press the trackpad driver can still freeze or slow the pointer
 //    for about 300 ms (to stop it wobbling while you click). With a faulty sensor that
 //    happens constantly, so during that window the pointer is kept where the raw finger
 //    motion says it should be, at the speed measured just before the press.
@@ -55,10 +56,11 @@ func now() -> Double { ProcessInfo.processInfo.systemUptime }
 
 // MARK: - Settings
 let defaults = UserDefaults.standard
-defaults.register(defaults: ["blockClicks": true, "silenceVibration": true, "calmForce": true])
+defaults.register(defaults: ["blockClicks": true, "silenceVibration": true, "calmForce": true, "smoothPointer": false])
 var blockClicks = defaults.bool(forKey: "blockClicks")
 var silenceVibration = defaults.bool(forKey: "silenceVibration")
 var calmForce = defaults.bool(forKey: "calmForce")
+var smoothPointer = defaults.bool(forKey: "smoothPointer")
 
 // MARK: - Tuning
 let tapMaxDuration = 0.30     // seconds a tap may last
@@ -234,6 +236,7 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
 var freeze: (t0: Double, path: Int32, fx: Float, fy: Float, c0: CGPoint, gx: Double, gy: Double)?
 
 func beginFreeze() {
+    guard smoothPointer else { freeze = nil; return }
     let t = now()
     lock.lock()
     let f = singleFinger
@@ -551,6 +554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let blockItem = NSMenuItem(title: "Block false clicks (Ctrl+Option+Cmd+B)", action: #selector(toggleBlock), keyEquivalent: "")
     let silenceItem = NSMenuItem(title: "Silence trackpad vibration", action: #selector(toggleSilence), keyEquivalent: "")
     let calmItem = NSMenuItem(title: "Turn off force response (fixes lag and scrolling)", action: #selector(toggleCalm), keyEquivalent: "")
+    let smoothItem = NSMenuItem(title: "Smooth pointer after false presses (experimental)", action: #selector(toggleSmooth), keyEquivalent: "")
     let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
     let permissionItem = NSMenuItem(title: "Grant Accessibility permission...", action: #selector(openAccessibility), keyEquivalent: "")
     var timer: Timer?
@@ -567,7 +571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine.isEnabled = false
         menu.addItem(statusLine)
         menu.addItem(.separator())
-        for i in [blockItem, silenceItem, calmItem, loginItem, permissionItem] {
+        for i in [blockItem, silenceItem, calmItem, smoothItem, loginItem, permissionItem] {
             i.target = self
             menu.addItem(i)
         }
@@ -680,6 +684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         silenceItem.state = silenceVibration ? .on : .off
         silenceItem.isEnabled = trackpad?.actuator != nil
         calmItem.state = calmForce ? .on : .off
+        smoothItem.state = smoothPointer ? .on : .off
         calmItem.isEnabled = trackpad?.mt.setForceResponse != nil
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         permissionItem.isHidden = trusted
@@ -697,6 +702,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         calmForce.toggle()
         defaults.set(calmForce, forKey: "calmForce")
         trackpad?.applyForceResponse()
+    }
+
+    @objc func toggleSmooth() {
+        smoothPointer.toggle()
+        defaults.set(smoothPointer, forKey: "smoothPointer")
+        freeze = nil
     }
 
     @objc func toggleLogin() {

@@ -9,11 +9,10 @@
 //    sensor still reports false presses (they are blocked above), but the driver no
 //    longer turns two-finger scrolls into drags, and its pointer freeze after each
 //    press happens about half as often.
-//  - Smooth pointer (optional, off by default: macOS's speed-dependent pointer acceleration
-//    makes it overshoot when you slow down to click): after a press the trackpad driver can still freeze or slow the pointer
-//    for about 300 ms (to stop it wobbling while you click). With a faulty sensor that
-//    happens constantly, so during that window the pointer is kept where the raw finger
-//    motion says it should be, at the speed measured just before the press.
+//  - Smooth pointer (optional): after a press the trackpad driver can still stop the pointer
+//    for ~300 ms. While it is stopped and the finger keeps moving, the pointer is moved frame
+//    by frame at the speed macOS itself uses for that finger speed (learned per speed band),
+//    and it stops the moment the driver moves the pointer again, so it never overshoots.
 //  - Silence vibration: turns off "SystemActuations" on the trackpad actuator, which
 //    stops the haptic tap that every false press triggers. Restored on quit.
 //  - Open at login.
@@ -68,18 +67,13 @@ let tapMaxMove: Float = 0.035 // normalized trackpad distance a tap may move
 let tapMaxSize: Float = 1.5   // bigger contacts (palms) never count as taps
 let liftGrace = 1.0           // clicks this soon after a lift are macOS's own tap-to-click (a two-finger
                               // tap arrives ~0.3 s late while macOS waits for a possible double tap)
-let typingGrace = 0.4         // ignore taps this soon after a key press
+let typingGrace = 0.25        // ignore taps this soon after a key press (palm brushes seen at 8-178 ms)
 let twoFingerLandSpread = 0.15 // both fingers of a two-finger tap must land this close together
 let magic: Int64 = 0x5450_4744 // marks our own synthetic events ("TPGD")
 let sensorScrollWindow = 1.0  // max length of one sensor-scroll episode after a two-finger false press
 let scrollGainY = defaults.object(forKey: "scrollGainY") as? Double ?? 1800 // pixels per trackpad height
 let scrollGainX = scrollGainY * 1.6 // the trackpad is ~1.6x wider than tall
 let freezeWindow = defaults.object(forKey: "freezeWindow") as? Double ?? 0.45 // driver slow-down after a press
-// Only smooth fast movement: macOS slows the pointer for slow, precise finger motion, so a
-// speed measured earlier would overshoot while you aim. Normalized trackpad units / second.
-let smoothMinSpeed = defaults.object(forKey: "smoothMinSpeed") as? Double ?? 0.25
-// Err on the side of less movement: overshooting a click target is worse than a tiny lag.
-let smoothGainScale = defaults.object(forKey: "smoothGainScale") as? Double ?? 0.85
 
 // MARK: - Touch state (written on the multitouch thread, guarded by lock)
 let lock = NSLock()
@@ -91,6 +85,7 @@ var touchMaxMove: Float = 0
 var touchMaxSize: Float = 0
 var touchStartPos: [Int32: (Float, Float)] = [:]
 var touchLandTimes: [Int32: Double] = [:]
+var touchPresses = 0 // false presses blocked during the current touch
 // Pointer smoothing (also guarded by lock)
 var singleFinger: (path: Int32, x: Float, y: Float)?  // when exactly one finger is down
 var freezeUntil: Double = 0              // set when a press is blocked
@@ -210,6 +205,7 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
             touchMaxSize = 0
             touchStartPos.removeAll()
             touchLandTimes.removeAll()
+            touchPresses = 0
         }
         for (path, x, y) in points {
             if let s = touchStartPos[path] {
@@ -230,6 +226,18 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
             tap = touchMaxFingers == 1 ? 1 : (touchMaxFingers == 2 && together ? 2 : 0)
             tapStarted = touchStart
         }
+        // Diagnostics: a short, mostly still touch that had a false press but made no click
+        // is probably a click attempt we missed; record why it did not count as a tap.
+        let dur = t - touchStart
+        if tap == 0 && touchPresses > 0 && dur < 1.0 && touchMaxMove < 0.1 && touchMaxFingers <= 2 {
+            var why: [String] = []
+            if dur >= tapMaxDuration { why.append("too long") }
+            if touchMaxMove >= tapMaxMove { why.append("moved") }
+            if touchMaxSize >= tapMaxSize { why.append("large contact") }
+            if touchMaxFingers == 2 && why.isEmpty { why.append("fingers landed apart") }
+            log(String(format: "no click for touch: %.0f ms, moved %.3f, %d finger(s), %d press(es) [%@]",
+                       dur * 1000, touchMaxMove, touchMaxFingers, touchPresses, why.joined(separator: ", ")))
+        }
     }
     fingersDown = active
     lock.unlock()
@@ -249,12 +257,33 @@ let mtCallback: MTCallback = { _, data, n, _, _ in
     return 0
 }
 
-// MARK: - Pointer smoothing
-// While a freeze window is open, the pointer should be at
-//   start position + gain * (finger travel since the press),
-// with the gain measured from the movement just before the press. Whatever the
-// driver does not deliver is topped up; the pointer is never pulled backwards.
-var freeze: (t0: Double, path: Int32, fx: Float, fy: Float, c0: CGPoint, gx: Double, gy: Double)?
+// MARK: - Pointer smoothing (experimental)
+// After a false press the driver may stop moving the pointer for up to ~300 ms. While the
+// driver has sent no pointer motion for `stallTime` and the finger is clearly moving, the
+// pointer is moved frame by frame from the raw finger motion, at the gain macOS itself uses
+// for that finger speed (learned per speed band during normal movement). As soon as the
+// driver moves the pointer again, filling stops: it only ever replaces missing motion.
+let stallTime = 0.025
+let fillMinSpeed = 0.08       // trackpad heights per second; slower is aiming or click wobble
+let trackpadAspect = 1.6      // width / height, to measure finger motion in equal units
+let speedBandEdges: [Double] = [0.05, 0.1, 0.2, 0.4, 0.8, 1.6] // trackpad heights per second
+var bandGain = [Double](repeating: 0, count: 7)   // pointer points per trackpad height
+var bandSamples = [Int](repeating: 0, count: 7)
+var lastDriverMotion: Double = 0                 // main thread: last real pointer motion event
+var fillPrev: (path: Int32, t: Double, x: Float, y: Float)?
+var freeze: (t0: Double, path: Int32)?
+
+func speedBand(_ v: Double) -> Int { speedBandEdges.firstIndex { v < $0 } ?? speedBandEdges.count }
+
+func gainFor(speed v: Double) -> Double? {
+    let b = speedBand(v)
+    if bandSamples[b] >= 5 { return bandGain[b] }
+    // Nearest band with enough data.
+    for d in 1..<bandGain.count {
+        for c in [b - d, b + d] where c >= 0 && c < bandGain.count && bandSamples[c] >= 5 { return bandGain[c] }
+    }
+    return nil
+}
 
 func beginFreeze() {
     guard smoothPointer else { freeze = nil; return }
@@ -262,74 +291,53 @@ func beginFreeze() {
     lock.lock()
     let f = singleFinger
     freezeUntil = t + freezeWindow
-    // Was this finger already moving? Look at the raw sensor over the last ~0.12 s.
-    var moving = false
-    if f != nil, t - touchStart > 0.12, let last = recentFinger.last,
-       let old = recentFinger.first(where: { last.t - $0.t <= 0.12 }), last.t - old.t >= 0.05 {
-        moving = hypot(Double(last.x - old.x), Double(last.y - old.y)) / (last.t - old.t) > smoothMinSpeed
-    }
     lock.unlock()
-    // A finger that was not already moving is tapping or resting: keep the driver's
-    // freeze, it is what stops the pointer wobbling during a click.
-    guard let f = f, moving, let c = CGEvent(source: nil)?.location else { freeze = nil; return }
-    let (gx, gy, how) = currentGain()
-    freeze = (t, f.path, f.x, f.y, c, gx * smoothGainScale, gy * smoothGainScale)
-    log(String(format: "freeze while moving: gain x=%.0f y=%.0f (%@)", gx, gy, how))
+    if let f = f { freeze = (t, f.path); fillPrev = nil } else { freeze = nil }
 }
 
 func smoothStep(path: Int32, x: Float, y: Float) {
-    guard blockClicks, gTap != nil, let fz = freeze, now() - fz.t0 < freezeWindow else { return }
-    // A different finger (one of two lifted) is not movement: stop smoothing.
-    guard path == fz.path else { freeze = nil; return }
+    guard smoothPointer, blockClicks, gTap != nil, let fz = freeze else { return }
+    let t = now()
+    guard t - fz.t0 < freezeWindow, path == fz.path else { freeze = nil; return }
+    defer { fillPrev = (path, t, x, y) }
+    guard let p = fillPrev, p.path == path, t - p.t > 0.001, t - p.t < 0.05 else { return }
+    let dx = Double(x - p.x) * trackpadAspect, dy = Double(y - p.y) // trackpad heights
+    let dist = hypot(dx, dy), speed = dist / (t - p.t)
+    // The driver is moving the pointer itself, or the finger is barely moving: leave it alone.
+    guard t - lastDriverMotion > stallTime, speed > fillMinSpeed, let g = gainFor(speed: speed) else { return }
+    let mx = dx * g, my = -dy * g // trackpad y grows upward, screen y downward
     guard let c = CGEvent(source: nil)?.location else { return }
-    let ex = Double(x - fz.fx) * fz.gx, ey = Double(y - fz.fy) * fz.gy
-    var dx = ex - (c.x - fz.c0.x), dy = ey - (c.y - fz.c0.y)
-    if dx * ex < 0 { dx = 0 } // already ahead on this axis: never pull back
-    if dy * ey < 0 { dy = 0 }
-    guard abs(dx) >= 0.5 || abs(dy) >= 0.5 else { return }
-    let target = clampToDisplays(CGPoint(x: c.x + dx, y: c.y + dy), from: c)
+    let target = clampToDisplays(CGPoint(x: c.x + mx, y: c.y + my), from: c)
     guard let e = CGEvent(mouseEventSource: synthSource, mouseType: .mouseMoved, mouseCursorPosition: target, mouseButton: .left) else { return }
     e.setIntegerValueField(.eventSourceUserData, value: magic)
-    e.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
-    e.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+    e.setIntegerValueField(.mouseEventDeltaX, value: Int64(mx.rounded()))
+    e.setIntegerValueField(.mouseEventDeltaY, value: Int64(my.rounded()))
     e.flags = CGEventSource.flagsState(.combinedSessionState)
     e.post(tap: .cghidEventTap)
-    if smoothedPoints == 0 || now() - fz.t0 < 0.02 { smoothedFreezes += 1 }
-    smoothedPoints += hypot(dx, dy)
+    if smoothedPoints == 0 || fz.t0 != lastSmoothedFreezeStart { smoothedFreezes += 1; lastSmoothedFreezeStart = fz.t0 }
+    smoothedPoints += hypot(mx, my)
 }
+var lastSmoothedFreezeStart = 0.0
 
-// Pointer speed: a short history of (finger, pointer) samples taken during normal
-// movement, plus a long-term average as a fallback.
-var speedHistory: [(t: Double, path: Int32, x: Float, y: Float, c: CGPoint)] = []
-var avgGainX = 1000.0, avgGainY = -700.0
+// Learn macOS's pointer gain per finger-speed band from normal movement (no recent press).
+var learnPrev: (t: Double, path: Int32, x: Float, y: Float, c: CGPoint)?
 func learnPointerSpeed() {
     let t = now()
     lock.lock()
     let finger = singleFinger
     let frozen = t < freezeUntil + 0.1
     lock.unlock()
-    guard let f = finger, !frozen, let c = CGEvent(source: nil)?.location else { speedHistory.removeAll(); return }
-    if let p = speedHistory.last, p.path != f.path { speedHistory.removeAll() }
-    if let p = speedHistory.last {
-        let fdx = Double(f.x - p.x), fdy = Double(f.y - p.y)
-        if abs(fdx) > 0.004 { let g = Double(c.x - p.c.x) / fdx; if abs(g) > 100 && abs(g) < 8000 { avgGainX = avgGainX * 0.9 + g * 0.1 } }
-        if abs(fdy) > 0.004 { let g = Double(c.y - p.c.y) / fdy; if abs(g) > 100 && abs(g) < 8000 { avgGainY = avgGainY * 0.9 + g * 0.1 } }
-    }
-    speedHistory.append((t, f.path, f.x, f.y, c))
-    speedHistory.removeAll { t - $0.t > 0.5 }
-}
-
-// Pointer speed from the movement just before now, or the long-term average.
-func currentGain() -> (Double, Double, String) {
-    guard let last = speedHistory.last, now() - last.t < 0.12,
-          let first = speedHistory.first(where: { last.t - $0.t <= 0.35 }), last.t - first.t >= 0.09 else {
-        return (avgGainX, avgGainY, "average")
-    }
-    let fdx = Double(last.x - first.x), fdy = Double(last.y - first.y)
-    var gx = avgGainX, gy = avgGainY
-    if abs(fdx) > 0.01 { let g = Double(last.c.x - first.c.x) / fdx; if abs(g) > 100 && abs(g) < 8000 { gx = g } }
-    if abs(fdy) > 0.01 { let g = Double(last.c.y - first.c.y) / fdy; if abs(g) > 100 && abs(g) < 8000 { gy = g } }
-    return (gx, gy, "recent")
+    guard let f = finger, !frozen, let c = CGEvent(source: nil)?.location else { learnPrev = nil; return }
+    defer { learnPrev = (t, f.path, f.x, f.y, c) }
+    guard let p = learnPrev, p.path == f.path, t - p.t < 0.15 else { return }
+    let dist = hypot(Double(f.x - p.x) * trackpadAspect, Double(f.y - p.y))
+    guard dist > 0.003 else { return }
+    let g = hypot(Double(c.x - p.c.x), Double(c.y - p.c.y)) / dist
+    guard g > 100 && g < 10000 else { return }
+    let b = speedBand(dist / (t - p.t))
+    bandGain[b] = bandSamples[b] == 0 ? g : bandGain[b] * 0.85 + g * 0.15
+    bandSamples[b] += 1
+    if bandSamples[b] == 5 { log(String(format: "learned pointer gain for speed band %d: %.0f", b, bandGain[b])) }
 }
 
 func clampToDisplays(_ p: CGPoint, from cur: CGPoint) -> CGPoint {
@@ -435,8 +443,9 @@ var synthClickState: Int64 = 1
 @discardableResult
 func synthesizeClick(right: Bool, touchStarted: Double, fromSystem: Bool = false) -> Bool {
     guard blockClicks, gTap != nil else { return false }
-    if CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown) < typingGrace {
-        log("tap ignored (typing)")
+    let sinceKey = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown)
+    if sinceKey < typingGrace {
+        log(String(format: "tap ignored (typing, %.0f ms after a key)", sinceKey * 1000))
         return false
     }
     if !fromSystem,
@@ -529,7 +538,10 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         if suppressL { suppressL = false; endScrollPin(); return nil }
     case .rightMouseUp:
         if suppressR { suppressR = false; endScrollPin(); return nil }
+    case .mouseMoved:
+        lastDriverMotion = now()
     case .leftMouseDragged, .rightMouseDragged:
+        lastDriverMotion = now()
         if (type == .leftMouseDragged && suppressL) || (type == .rightMouseDragged && suppressR) {
             lock.lock(); let fingers = fingersDown; lock.unlock()
             if fingers >= 2 {
@@ -570,6 +582,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
                 return nil
             }
             blockedCount += 1
+            lock.lock(); touchPresses += 1; lock.unlock()
             beginFreeze()
             if fingers == 2 {
                 lock.lock(); sensorScrollUntil = now() + sensorScrollWindow; lock.unlock()
@@ -588,7 +601,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
 
 func createTap() -> Bool {
     var mask: CGEventMask = 0
-    for t: CGEventType in [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+    for t: CGEventType in [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .mouseMoved,
                            .leftMouseDragged, .rightMouseDragged, .keyDown] {
         mask |= CGEventMask(1) << CGEventMask(t.rawValue)
     }

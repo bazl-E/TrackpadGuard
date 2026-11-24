@@ -5,6 +5,8 @@
 //    (or just lifted) are dropped, and their drags become plain pointer moves.
 //    Real taps, read from the raw touch sensor, become clicks instead
 //    (1 finger = left, 2 fingers = right). Three-finger drag is let through.
+//    Taps that begin within `typingGrace` of a key press (palm brushes) are ignored, and so
+//    are all taps while macOS itself ignores the trackpad because a mouse is connected.
 //  - Calm force response: tells the trackpad driver to stop reacting to force. The
 //    sensor still reports false presses (they are blocked above), but the driver no
 //    longer turns two-finger scrolls into drags, and its pointer freeze after each
@@ -22,6 +24,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import IOKit
 import ServiceManagement
 
 // MARK: - Logging
@@ -67,7 +70,11 @@ let tapMaxMove: Float = 0.035 // normalized trackpad distance a tap may move
 let tapMaxSize: Float = 1.5   // bigger contacts (palms) never count as taps
 let liftGrace = 1.0           // clicks this soon after a lift are macOS's own tap-to-click (a two-finger
                               // tap arrives ~0.3 s late while macOS waits for a possible double tap)
-let typingGrace = 0.25        // ignore taps this soon after a key press (palm brushes seen at 8-178 ms)
+// Ignore taps whose touch began this soon after a key press. Palm brushes while typing were
+// seen to turn into clicks up to ~1.7 s after a key when this was 0.25 s measured at lift.
+// Tune with: defaults write io.github.bazl-e.trackpadguard typingGrace -float 1.5
+let typingGrace = defaults.object(forKey: "typingGrace") as? Double ?? 1.0
+let systemTapTypingGrace = 0.25 // macOS's own tap-to-click already rejects palms
 let twoFingerLandSpread = 0.15 // both fingers of a two-finger tap must land this close together
 let magic: Int64 = 0x5450_4744 // marks our own synthetic events ("TPGD")
 let sensorScrollWindow = 1.0  // max length of one sensor-scroll episode after a two-finger false press
@@ -434,6 +441,44 @@ final class Trackpad {
     }
 }
 
+// MARK: - Is macOS ignoring the trackpad?
+// With "Ignore built-in trackpad when mouse or wireless trackpad is present" on (Accessibility,
+// Pointer Control) and a mouse plugged in, macOS ignores the built-in trackpad. The raw touch
+// stream still reaches us, so without this check every palm brush could become a click.
+func ignoreTrackpadSettingOn() -> Bool {
+    for name in ["com.apple.AppleMultitouchTrackpad", "com.apple.driver.AppleBluetoothMultitouch.trackpad"] {
+        let domain = name as CFString
+        CFPreferencesAppSynchronize(domain)
+        if let v = CFPreferencesCopyAppValue("USBMouseStopsTrackpad" as CFString, domain) as? NSNumber {
+            return v.boolValue
+        }
+    }
+    return false
+}
+
+// Any external mouse, pointer or trackpad (built-in devices do not count).
+func externalPointerConnected() -> Bool {
+    var it: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOHIDDevice"), &it) == KERN_SUCCESS else { return false }
+    defer { IOObjectRelease(it) }
+    var found = false
+    var s = IOIteratorNext(it)
+    while s != 0 {
+        func prop(_ key: String) -> Any? { IORegistryEntryCreateCFProperty(s, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() }
+        let page = (prop("PrimaryUsagePage") as? NSNumber)?.intValue ?? 0
+        let usage = (prop("PrimaryUsage") as? NSNumber)?.intValue ?? 0
+        let builtIn = (prop("Built-In") as? NSNumber)?.boolValue ?? false
+        let pointer = (page == 0x01 && (usage == 0x01 || usage == 0x02)) // Generic Desktop: pointer, mouse
+            || (page == 0x0D && usage == 0x05)                            // Digitizer: touch pad
+        if pointer && !builtIn { found = true }
+        IOObjectRelease(s)
+        s = IOIteratorNext(it)
+    }
+    return found
+}
+
+func trackpadIgnoredByMacOS() -> Bool { ignoreTrackpadSettingOn() && externalPointerConnected() }
+
 // MARK: - Synthetic clicks from taps
 let synthSource = CGEventSource(stateID: .privateState)
 var lastSynth: (t: Double, loc: CGPoint, right: Bool) = (-10, .zero, false)
@@ -444,9 +489,24 @@ var synthClickState: Int64 = 1
 func synthesizeClick(right: Bool, touchStarted: Double, fromSystem: Bool = false) -> Bool {
     guard blockClicks, gTap != nil else { return false }
     let sinceKey = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown)
-    if sinceKey < typingGrace {
-        log(String(format: "tap ignored (typing, %.0f ms after a key)", sinceKey * 1000))
-        return false
+    // How long after the last key press the touch began (negative: a key was pressed during it).
+    let keyGap = fromSystem ? sinceKey : sinceKey - (now() - touchStarted)
+    let keyGapText = keyGap < 0 ? "a key was pressed during the touch"
+        : String(format: "touch began %.0f ms after a key", keyGap * 1000)
+    if fromSystem {
+        if sinceKey < systemTapTypingGrace {
+            log(String(format: "tap ignored (typing, %.0f ms after a key)", sinceKey * 1000))
+            return false
+        }
+    } else {
+        if trackpadIgnoredByMacOS() {
+            log("tap ignored (mouse connected and macOS is set to ignore the trackpad; \(keyGapText))")
+            return false
+        }
+        if keyGap < typingGrace {
+            log("tap ignored (typing, \(keyGapText))")
+            return false
+        }
     }
     if !fromSystem,
        CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .scrollWheel) < now() - touchStarted + 0.05 {
@@ -475,7 +535,7 @@ func synthesizeClick(right: Bool, touchStarted: Double, fromSystem: Bool = false
     down.post(tap: .cghidEventTap)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.015) { up.post(tap: .cghidEventTap) }
     tapClickCount += 1
-    log("\(fromSystem ? "macOS tap" : "tap") -> \(right ? "right" : "left") click x\(synthClickState)")
+    log("\(fromSystem ? "macOS tap" : "tap") -> \(right ? "right" : "left") click x\(synthClickState) (\(keyGapText))")
     return true
 }
 
@@ -745,6 +805,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusLine.title = "Click blocking paused"
         } else if gTap == nil {
             statusLine.title = "Needs Accessibility permission"
+        } else if trackpadIgnoredByMacOS() {
+            statusLine.title = "Mouse connected: macOS ignores the trackpad, taps off"
         } else {
             statusLine.title = "Blocked \(blockedCount) false clicks, smoothed \(smoothedFreezes) freezes"
         }

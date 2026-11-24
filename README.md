@@ -24,6 +24,8 @@ The touch surface itself usually still works perfectly. Only the force sensor is
 | **Silence vibration** | Turns off system actuations on the trackpad's haptic motor, so false presses no longer buzz. Restored when you quit. |
 | **Open at login** | A menu toggle. |
 
+Palm brushes while typing are not clicks: a tap that begins less than 1 second after a key press is ignored (change it with `defaults write io.github.bazl-e.trackpadguard typingGrace -float 1.5`, then restart the app). Taps are also ignored while a mouse is connected and "Ignore built-in trackpad when mouse or wireless trackpad is present" is on (System Settings, Accessibility, Pointer Control), because macOS is ignoring the trackpad then too.
+
 Taps are recognized from the raw touch sensor. When TrackpadGuard is unsure (for example a short two-finger touch that might have been the start of a scroll), it leaves the decision to macOS's own tap-to-click, so you never get two clicks for one tap.
 
 Controls once it is running:
